@@ -1,94 +1,42 @@
-:root {
-  --wac-bg: #ffffff;
-  --wac-fg: #3b4a54;
-  --wac-border: rgba(11, 20, 26, 0.12);
-  --wac-hover: #f0f2f5;
-  --wac-accent: #00a884;
-  --wac-accent-fg: #ffffff;
-  --wac-sel-bg: rgba(0, 168, 132, 0.14);
-  --wac-shadow: 0 2px 8px rgba(11, 20, 26, 0.16);
-}
-body.dark {
-  --wac-bg: #233138;
-  --wac-fg: #d1d7db;
-  --wac-border: rgba(233, 237, 239, 0.12);
-  --wac-hover: #2a3942;
-  --wac-sel-bg: rgba(0, 168, 132, 0.22);
-  --wac-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
-}
+/* Buttons next to messages and in the select bar are clones of WhatsApp's own elements and
+   inherit its styling. Only the day-separator buttons and the fallback toast are styled here;
+   the day buttons copy their colors from the date pill at runtime. */
 
-#wac-tools {
+/* WhatsApp unmounts its React button when the pointer leaves; our clones stay in the DOM,
+   so show them only while the message is hovered, and never in select mode. */
+.wac-unit { display: none !important; }
+[data-testid^="conv-msg-"]:hover .wac-unit { display: block !important; }
+body.wac-selecting .wac-unit { display: none !important; }
+
+#wac-day {
   position: fixed;
-  z-index: 10000;
+  z-index: 1000;
   display: none;
-  gap: 2px;
-  padding: 2px;
-  background: var(--wac-bg);
-  border: 1px solid var(--wac-border);
-  border-radius: 999px;
-  box-shadow: var(--wac-shadow);
+  gap: 6px;
 }
-#wac-tools button,
-#wac-bar button {
+#wac-day button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 6px;
+  padding: 0;
   border: 0;
-  background: transparent;
-  color: var(--wac-fg);
+  border-radius: 7.5px;
   cursor: pointer;
-  font: inherit;
+  transition: filter 0.1s;
 }
-#wac-tools button {
-  width: 28px;
-  height: 28px;
-  border-radius: 999px;
-}
-#wac-tools button:hover { background: var(--wac-hover); }
-#wac-tools button[data-act="select"] svg { opacity: 0.35; }
-#wac-tools.wac-on button[data-act="select"] {
-  background: var(--wac-accent);
-  color: var(--wac-accent-fg);
-}
-#wac-tools.wac-on button[data-act="select"] svg { opacity: 1; }
-
-#wac-bar {
-  position: fixed;
-  z-index: 10000;
-  display: none;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 6px 6px 16px;
-  transform: translateX(-50%);
-  background: var(--wac-bg);
-  color: var(--wac-fg);
-  border: 1px solid var(--wac-border);
-  border-radius: 999px;
-  box-shadow: var(--wac-shadow);
-  font-size: 14px;
-  white-space: nowrap;
-}
-#wac-bar .wac-count { font-variant-numeric: tabular-nums; margin-right: 4px; }
-#wac-bar button { height: 34px; border-radius: 999px; padding: 0 10px; }
-#wac-bar button:hover { background: var(--wac-hover); }
-#wac-bar .wac-primary {
-  background: var(--wac-accent);
-  color: var(--wac-accent-fg);
-  padding: 0 14px;
-  font-weight: 500;
-}
-#wac-bar .wac-primary:hover { background: var(--wac-accent); filter: brightness(1.08); }
+#wac-day button:hover { filter: brightness(0.95); }
 
 #wac-toast {
   position: fixed;
+  left: 50%;
+  bottom: 88px;
   z-index: 10001;
-  transform: translate(-50%, -6px);
-  padding: 8px 14px;
-  background: #111b21;
+  transform: translate(-50%, 6px);
+  padding: 10px 16px;
+  background: #3b4a54;
   color: #fff;
   border-radius: 8px;
-  font-size: 13.5px;
+  font-size: 14px;
   opacity: 0;
   pointer-events: none;
   transition: opacity 0.15s, transform 0.15s;

@@ -137,61 +137,57 @@
     return `[${time}] ${who}: ${body}`;
   }
 
-  // ---------- selection ----------
-  let selected = new Set();
+  // ---------- WhatsApp's own multi-select (props of the conversation's React tree) ----------
+  const fiberOf = (el) => {
+    const k = el && Object.keys(el).find((x) => x.startsWith('__reactFiber'));
+    return k ? el[k] : null;
+  };
+  function convProps() {
+    const el = document.querySelector('#main ' + MSG_SEL);
+    for (let f = fiberOf(el), i = 0; f && i < 60; f = f.return, i++) {
+      const p = f.memoizedProps;
+      if (p && p.selectedMessages && typeof p.onSelectMessages === 'function') return p;
+    }
+    return null;
+  }
+  const inSelectMode = () => !!convProps()?.selectable;
+  const nextFrame = () => new Promise((r) => requestAnimationFrame(() => setTimeout(r, 30)));
+
+  async function selectMsgs(msgs) {
+    let p = convProps();
+    if (!p) return false;
+    if (!p.selectable) {
+      p.onSelectMessages();
+      await nextFrame();
+      p = convProps() || p;
+    }
+    for (const m of msgs) p.selectedMessages.setVal(m, true);
+    return true;
+  }
+  function selectedMsgs() {
+    const sel = convProps()?.selectedMessages?.getSelected?.() ?? [];
+    return sel.filter(exportable).sort((a, b) => a.t - b.t || (a.rowId ?? 0) - (b.rowId ?? 0));
+  }
+
+  // Shift+click range anchor (last message clicked/selected in select mode).
   let anchor = null;
-  let chatKey = null;
-
-  function domIds() {
-    return [...document.querySelectorAll('#main ' + MSG_SEL)].map((e) => e.getAttribute('data-id'));
-  }
-  function orderedIds() {
+  function rangeMsgs(fromId, toId) {
     const msgs = chatMsgs();
-    return msgs.length ? msgs.map((m) => m.id.id) : domIds();
-  }
-  function selectRange(fromId, toId) {
-    const ids = orderedIds();
-    let a = ids.indexOf(fromId), b = ids.indexOf(toId);
-    if (a < 0 || b < 0) { selected.add(toId); return; }
+    let a = msgs.findIndex((m) => m.id.id === fromId);
+    let b = msgs.findIndex((m) => m.id.id === toId);
+    if (a < 0 || b < 0) return [];
     if (a > b) [a, b] = [b, a];
-    selected = new Set(ids.slice(a, b + 1));
-  }
-  function toggle(id) {
-    selected.has(id) ? selected.delete(id) : selected.add(id);
-    anchor = id;
-  }
-  function clearSel() {
-    selected = new Set();
-    anchor = null;
-    render();
-  }
-  function selectionText() {
-    const msgs = chatMsgs();
-    if (msgs.length) {
-      return msgs.filter((m) => selected.has(m.id.id)).map(formatMsg).join('\n');
-    }
-    return [...document.querySelectorAll('#main ' + MSG_SEL)]
-      .filter((el) => selected.has(el.getAttribute('data-id')))
-      .map(formatDom).join('\n');
-  }
-  function singleText(el) {
-    const m = msgById(el.getAttribute('data-id'));
-    return m ? formatMsg(m) : formatDom(el);
-  }
-  function selCount() {
-    const msgs = chatMsgs();
-    return msgs.length ? msgs.filter((m) => selected.has(m.id.id)).length : selected.size;
-  }
-  function checkChat() {
-    const c = activeChat();
-    const key = c?.id?._serialized || location.href;
-    if (key !== chatKey) {
-      chatKey = key;
-      if (selected.size) clearSel();
-    }
+    return msgs.slice(a, b + 1);
   }
 
-  // ---------- clipboard ----------
+  // ---------- days ----------
+  const dayKey = (t) => {
+    const d = new Date(t * 1000);
+    return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+  };
+  const dayMsgs = (key) => chatMsgs().filter((m) => dayKey(m.t) === key);
+
+  // ---------- copy + feedback ----------
   async function copyText(t) {
     try {
       await navigator.clipboard.writeText(t);
@@ -207,187 +203,316 @@
       return ok;
     }
   }
-  const plural = (n) => (n === 1 ? 'zpráva' : n >= 2 && n <= 4 ? 'zprávy' : 'zpráv');
-  async function doCopy(text, n) {
-    const ok = await copyText(text);
-    toast(ok ? `Zkopírováno: ${n} ${plural(n)}` : 'Kopírování selhalo');
+  function toast(msg) {
+    try {
+      const { ToastManager } = window.require('WAWebToastManager');
+      const T = window.require('WAWebToast.react');
+      const R = window.require('React');
+      ToastManager.open(R.createElement(T.Toast, { msg, id: T.genId() }));
+      return;
+    } catch {}
+    let el = document.getElementById('wac-toast');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'wac-toast';
+      document.body.appendChild(el);
+    }
+    el.textContent = msg;
+    el.classList.add('wac-show');
+    clearTimeout(el._t);
+    el._t = setTimeout(() => el.classList.remove('wac-show'), 1800);
+  }
+  async function copyMsgs(msgs) {
+    if (!msgs.length) return toast('Nothing to copy');
+    const ok = await copyText(msgs.map(formatMsg).join('\n'));
+    const n = msgs.length;
+    toast(ok ? `Copied ${n} message${n === 1 ? '' : 's'}` : "Couldn't copy");
   }
 
-  // ---------- UI ----------
-  const ICON_COPY = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>';
-  const ICON_CHECK = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>';
-  const ICON_X = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>';
-
-  const tools = document.createElement('div');
-  tools.id = 'wac-tools';
-  tools.innerHTML =
-    `<button type="button" data-act="select" title="Vybrat (Shift = rozsah, ⌘ = přidat)">${ICON_CHECK}</button>` +
-    `<button type="button" data-act="copy" title="Kopírovat">${ICON_COPY}</button>`;
-
-  const bar = document.createElement('div');
-  bar.id = 'wac-bar';
-  bar.innerHTML =
-    '<span class="wac-count"></span>' +
-    `<button type="button" data-act="copy-sel" class="wac-primary">${ICON_COPY}<span>Kopírovat</span></button>` +
-    `<button type="button" data-act="clear" title="Zrušit výběr (Esc)">${ICON_X}</button>`;
-
-  const toastEl = document.createElement('div');
-  toastEl.id = 'wac-toast';
-
-  const selStyle = document.createElement('style');
-  selStyle.id = 'wac-sel-style';
-
-  function mount() {
-    if (!document.body) return;
-    for (const el of [tools, bar, toastEl]) if (!el.isConnected) document.body.appendChild(el);
-    if (!selStyle.isConnected) document.head.appendChild(selStyle);
+  // ---------- icons (Material Icons, same 24px grid WhatsApp uses) ----------
+  const P_COPY = 'M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z';
+  const P_SELECT = 'M19 3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.11 0 2-.9 2-2V5c0-1.1-.89-2-2-2zm0 16H5V5h14v14zM17.99 9l-1.41-1.42-6.59 6.59-2.58-2.57-1.42 1.41 4 3.99z';
+  const P_SELECT_ALL = 'M20 4v12H8V4h12m0-2H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-8.5 9.67l-1.7-1.68L8.4 11.4l3.1 3.1 6.1-6.1-1.4-1.4zM4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6z';
+  function svg(path, size = 20) {
+    const NS = 'http://www.w3.org/2000/svg';
+    const s = document.createElementNS(NS, 'svg');
+    s.setAttribute('viewBox', '0 0 24 24');
+    s.setAttribute('height', size);
+    s.setAttribute('width', size);
+    s.setAttribute('fill', 'currentColor');
+    s.setAttribute('aria-hidden', 'true');
+    const p = document.createElementNS(NS, 'path');
+    p.setAttribute('d', path);
+    s.appendChild(p);
+    return s;
   }
 
-  let hoverEl = null;
-  let hideTimer = null;
+  // ---------- hover buttons next to WhatsApp's own "React" button ----------
+  // We clone WhatsApp's button wrapper so ours carry the exact same classes (size, shadow,
+  // hover state, dark mode) and sit in the same flex row as the native one.
+  function injectMsgButtons(reactBtn) {
+    let container = reactBtn.parentElement;
+    for (let i = 0; container && i < 4 && getComputedStyle(container).position !== 'absolute'; i++) {
+      container = container.parentElement;
+    }
+    if (!container) return;
+    let unit = reactBtn;
+    while (unit.parentElement && unit.parentElement !== container) unit = unit.parentElement;
+    // Keep React next to the bubble and ours further out (mirrored for outgoing messages).
+    const msgEl = container.closest(MSG_SEL);
+    const out = msgById(msgEl?.getAttribute('data-id'))?.id?.fromMe ?? !!msgEl?.querySelector('[data-icon="tail-out"]');
+    let mine = [...container.querySelectorAll(':scope > .wac-unit')];
+    if (mine.length) {
+      // WhatsApp re-inserts its React button on every hover; put ours back in place around it.
+      if (out ? unit.previousElementSibling !== mine[mine.length - 1] : unit.nextElementSibling !== mine[0]) {
+        out ? unit.before(...mine) : unit.after(...mine);
+      }
+      return;
+    }
+    const make = (act, label, path) => {
+      const u = unit.cloneNode(true);
+      u.classList.add('wac-unit');
+      const b = u.querySelector('[role="button"]') || u;
+      b.removeAttribute('data-testid');
+      b.setAttribute('aria-label', label);
+      b.setAttribute('title', label);
+      b.dataset.wacAct = act;
+      const old = b.querySelector('svg');
+      if (old) old.replaceWith(svg(path));
+      else b.appendChild(svg(path));
+      return u;
+    };
+    mine = [make('copy', 'Copy message', P_COPY), make('select', 'Select messages', P_SELECT)];
+    out ? unit.before(...mine.reverse()) : unit.after(...mine);
+  }
 
-  function placeTools(el) {
-    const bubble = el.querySelector('[data-testid="msg-container"]') || el;
-    const r = bubble.getBoundingClientRect();
-    const main = document.querySelector('#main')?.getBoundingClientRect();
-    if (!r.height || !main) return hideTools();
-    const id = el.getAttribute('data-id');
-    tools.classList.toggle('wac-on', selected.has(id));
-    tools.style.display = 'flex';
-    const w = tools.offsetWidth;
-    const right = r.left + r.width / 2 > main.left + main.width / 2; // outgoing bubble sits on the right
-    let left = right ? r.left - w - 6 : r.right + 6;
-    left = Math.max(main.left + 4, Math.min(left, main.right - w - 4));
-    const top = Math.max(main.top + 60, Math.min(r.top + 2, r.bottom - tools.offsetHeight));
-    tools.style.left = left + 'px';
-    tools.style.top = top + 'px';
-  }
-  function showTools(el) {
-    clearTimeout(hideTimer);
-    hoverEl = el;
-    placeTools(el);
-  }
-  function hideTools() {
-    tools.style.display = 'none';
-    hoverEl = null;
-  }
-  function scheduleHide() {
-    clearTimeout(hideTimer);
-    hideTimer = setTimeout(hideTools, 150);
-  }
-
-  function render() {
-    const n = selCount();
-    bar.querySelector('.wac-count').textContent = `${n} ${plural(n)}`;
-    bar.style.display = selected.size ? 'flex' : 'none';
-    if (selected.size) {
-      const main = document.querySelector('#main');
-      const footer = main?.querySelector('footer');
-      const mr = main?.getBoundingClientRect();
-      if (mr) {
-        bar.style.left = mr.left + mr.width / 2 + 'px';
-        const bottomEdge = footer ? footer.getBoundingClientRect().top : mr.bottom;
-        bar.style.top = bottomEdge - 56 + 'px';
+  // ---------- "Copy" in WhatsApp's own multi-select bar ----------
+  function findSelectBar() {
+    for (const b of document.querySelectorAll('#main button')) {
+      for (let f = fiberOf(b), i = 0; f && i < 25; f = f.return, i++) {
+        const p = f.memoizedProps;
+        if (p && p.selectedMessages && typeof p.onCancel === 'function') return b;
       }
     }
-    const ids = [...selected].map((id) => `#main [data-id="${CSS.escape(id)}"]`);
-    selStyle.textContent = ids.length
-      ? `${ids.join(',\n')} { background-color: var(--wac-sel-bg) !important; }`
-      : '';
-    if (hoverEl) placeTools(hoverEl);
+    return null;
+  }
+  function injectBarButton() {
+    const anyBtn = findSelectBar();
+    if (!anyBtn) return;
+    // The action group is the closest ancestor holding several buttons; the bar holds them all.
+    let bar = anyBtn;
+    while (bar.parentElement && bar.querySelectorAll('button').length < 4) bar = bar.parentElement;
+    if (bar.querySelector('.wac-bar-unit')) return;
+    // Right-hand action group (Star, Delete, Forward, Download) = smallest ancestor of the last
+    // two buttons; the first button (Cancel) lives outside it.
+    const btns = [...bar.querySelectorAll('button')];
+    if (btns.length < 3) return;
+    const last = btns[btns.length - 1];
+    let group = last.parentElement;
+    while (group && !group.contains(btns[btns.length - 2])) group = group.parentElement;
+    if (!group || group.contains(btns[0])) return;
+    const unitOf = (b) => {
+      let u = b;
+      while (u.parentElement && u.parentElement !== group) u = u.parentElement;
+      return u;
+    };
+    // Clone an enabled button so the copy doesn't inherit the greyed-out look.
+    const source = btns.slice(1).reverse().find((b) => group.contains(b) && !b.disabled && b.getAttribute('aria-disabled') !== 'true') || last;
+    const u = unitOf(source).cloneNode(true);
+    u.classList.add('wac-bar-unit');
+    const b = u.querySelector('button') || u;
+    b.removeAttribute('disabled');
+    b.removeAttribute('aria-disabled');
+    b.removeAttribute('data-testid');
+    b.setAttribute('aria-label', 'Copy');
+    b.setAttribute('title', 'Copy  (⌘C)');
+    b.dataset.wacAct = 'copy-selected';
+    const old = b.querySelector('svg');
+    if (old) old.replaceWith(svg(P_COPY, 24));
+    else b.appendChild(svg(P_COPY, 24));
+    group.insertBefore(u, unitOf(btns.find((b) => group.contains(b))));
   }
 
-  let toastTimer = null;
-  function toast(msg) {
-    toastEl.textContent = msg;
-    const mr = document.querySelector('#main')?.getBoundingClientRect();
-    toastEl.style.left = (mr ? mr.left + mr.width / 2 : window.innerWidth / 2) + 'px';
-    toastEl.style.top = (mr ? mr.top + 72 : 72) + 'px';
-    toastEl.classList.add('wac-show');
-    clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => toastEl.classList.remove('wac-show'), 1600);
+  // ---------- day separators ("Today", "Friday", "7/14/2026") ----------
+  let listEl = null;
+  function messageList() {
+    if (listEl?.isConnected && listEl.querySelector(MSG_SEL)) return listEl;
+    const msgs = document.querySelectorAll('#main ' + MSG_SEL);
+    if (msgs.length < 2) return (listEl = msgs[0]?.closest('[role="row"]')?.parentElement?.parentElement?.parentElement || null);
+    let a = msgs[0];
+    while (a && !a.contains(msgs[1])) a = a.parentElement;
+    return (listEl = a);
+  }
+  function separatorAt(target) {
+    const list = messageList();
+    if (!list || !list.contains(target)) return null;
+    let el = target;
+    while (el && el.parentElement !== list) el = el.parentElement;
+    if (!el || el.querySelector(MSG_SEL)) return null;
+    const text = el.innerText?.trim();
+    if (!text || text.length > 40 || text.includes('\n')) return null;
+    return el;
+  }
+  function separatorDay(sep) {
+    for (let n = sep.nextElementSibling; n; n = n.nextElementSibling) {
+      const msgEl = n.querySelector(MSG_SEL);
+      const m = msgEl && msgById(msgEl.getAttribute('data-id'));
+      if (m) return dayKey(m.t);
+    }
+    return null;
+  }
+  function pillOf(sep) {
+    for (const el of sep.querySelectorAll('*')) {
+      const bg = getComputedStyle(el).backgroundColor;
+      if (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent') return el;
+    }
+    return sep.firstElementChild || sep;
   }
 
-  function pick(el, e) {
-    const id = el.getAttribute('data-id');
-    if (e.shiftKey && anchor) selectRange(anchor, id);
-    else toggle(id);
-    render();
+  const dayTools = document.createElement('div');
+  dayTools.id = 'wac-day';
+  const dayBtn = (act, label, path) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.dataset.wacAct = act;
+    b.setAttribute('aria-label', label);
+    b.title = label;
+    b.appendChild(svg(path, 16));
+    return b;
+  };
+  dayTools.append(dayBtn('select-day', 'Select whole day', P_SELECT_ALL), dayBtn('copy-day', 'Copy whole day', P_COPY));
+  let daySep = null;
+  let dayHideTimer = null;
+
+  function showDayTools(sep) {
+    clearTimeout(dayHideTimer);
+    if (!dayTools.isConnected) document.body.appendChild(dayTools);
+    daySep = sep;
+    const pill = pillOf(sep);
+    const r = pill.getBoundingClientRect();
+    const cs = getComputedStyle(pill);
+    for (const b of dayTools.children) {
+      b.style.background = cs.backgroundColor;
+      b.style.color = cs.color;
+      b.style.boxShadow = cs.boxShadow;
+      b.style.height = b.style.width = Math.round(r.height) + 'px';
+    }
+    dayTools.style.display = 'flex';
+    dayTools.style.left = r.right + 6 + 'px';
+    dayTools.style.top = r.top + 'px';
+  }
+  function hideDayTools() {
+    dayTools.style.display = 'none';
+    daySep = null;
   }
 
   // ---------- events ----------
+  // Inject buttons whenever WhatsApp renders its hover controls or the select bar.
+  let scheduled = false;
+  function scan() {
+    scheduled = false;
+    for (const rb of document.querySelectorAll('#main [data-testid="reaction-entry-point"]')) injectMsgButtons(rb);
+    const selecting = inSelectMode();
+    document.body.classList.toggle('wac-selecting', selecting);
+    if (selecting) injectBarButton();
+  }
+  new MutationObserver(() => {
+    if (!scheduled) {
+      scheduled = true;
+      requestAnimationFrame(scan);
+    }
+  }).observe(document.body, { childList: true, subtree: true });
+
   document.addEventListener('mouseover', (e) => {
     const t = e.target;
     if (!(t instanceof Element)) return;
-    if (t.closest('#wac-tools')) { clearTimeout(hideTimer); return; }
-    const el = t.closest('#main ' + MSG_SEL);
-    if (el) {
-      mount();
-      checkChat();
-      if (el !== hoverEl) showTools(el);
-      else clearTimeout(hideTimer);
-    } else if (hoverEl) scheduleHide();
-  }, true);
-
-  tools.addEventListener('mousedown', (e) => e.preventDefault()); // keep composer focus & text selection intact
-  tools.addEventListener('click', (e) => {
-    const btn = e.target.closest('button');
-    if (!btn || !hoverEl) return;
-    e.stopPropagation();
-    if (btn.dataset.act === 'select') pick(hoverEl, e);
-    else if (btn.dataset.act === 'copy') {
-      const id = hoverEl.getAttribute('data-id');
-      if (selected.size > 1 && selected.has(id)) doCopy(selectionText(), selCount());
-      else doCopy(singleText(hoverEl), 1);
+    if (t.closest('#wac-day')) return clearTimeout(dayHideTimer);
+    const sep = separatorAt(t);
+    if (sep) return sep !== daySep ? showDayTools(sep) : clearTimeout(dayHideTimer);
+    if (daySep) {
+      clearTimeout(dayHideTimer);
+      dayHideTimer = setTimeout(hideDayTools, 200);
     }
-  });
-
-  bar.addEventListener('mousedown', (e) => e.preventDefault());
-  bar.addEventListener('click', (e) => {
-    const btn = e.target.closest('button');
-    if (!btn) return;
-    if (btn.dataset.act === 'copy-sel') doCopy(selectionText(), selCount());
-    else if (btn.dataset.act === 'clear') clearSel();
-  });
-
-  // While something is selected: Shift+click a message = range, ⌘/Ctrl+click = add/remove.
-  document.addEventListener('mousedown', (e) => {
-    if (!selected.size || !(e.shiftKey || e.metaKey || e.ctrlKey)) return;
-    if (e.target.closest?.('#main ' + MSG_SEL)) e.preventDefault(); // no native text selection
   }, true);
-  document.addEventListener('click', (e) => {
-    if (!selected.size || !(e.shiftKey || e.metaKey || e.ctrlKey)) return;
-    const t = e.target;
-    if (!(t instanceof Element) || t.closest('#wac-tools, #wac-bar')) return;
-    const el = t.closest('#main ' + MSG_SEL);
-    if (!el) return;
+  document.addEventListener('scroll', () => daySep && hideDayTools(), true);
+
+  const swallow = (e) => {
     e.preventDefault();
     e.stopPropagation();
-    pick(el, e);
+    e.stopImmediatePropagation();
+  };
+
+  // Our buttons: handle on pointerdown/click in capture phase so WhatsApp's handlers never see them.
+  window.addEventListener('pointerdown', (e) => {
+    if (e.target instanceof Element && e.target.closest('[data-wac-act]')) swallow(e);
+  }, true);
+  window.addEventListener('mousedown', (e) => {
+    const t = e.target;
+    if (!(t instanceof Element)) return;
+    if (t.closest('[data-wac-act]')) return swallow(e);
+    // Shift+click in select mode would otherwise start a native text selection.
+    if (e.shiftKey && t.closest('#main [role="row"]') && inSelectMode()) e.preventDefault();
   }, true);
 
-  document.addEventListener('keydown', (e) => {
-    if (!selected.size) return;
-    if (e.key === 'Escape') {
-      e.preventDefault();
-      e.stopImmediatePropagation();
-      clearSel();
-    } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'c' && window.getSelection()?.isCollapsed !== false) {
-      e.preventDefault();
-      e.stopImmediatePropagation();
-      doCopy(selectionText(), selCount());
+  window.addEventListener('click', async (e) => {
+    const t = e.target;
+    if (!(t instanceof Element)) return;
+    const btn = t.closest('[data-wac-act]');
+    if (btn) {
+      swallow(e);
+      const act = btn.dataset.wacAct;
+      if (act === 'copy-selected') return copyMsgs(selectedMsgs());
+      if (act === 'select-day' || act === 'copy-day') {
+        const key = daySep && separatorDay(daySep);
+        const msgs = key ? dayMsgs(key) : [];
+        if (act === 'copy-day') return copyMsgs(msgs);
+        if (msgs.length && (await selectMsgs(msgs))) anchor = msgs[msgs.length - 1].id.id;
+        return;
+      }
+      const msgEl = btn.closest(MSG_SEL);
+      const m = msgEl && msgById(msgEl.getAttribute('data-id'));
+      if (act === 'copy') {
+        if (m) return copyMsgs([m]);
+        const ok = msgEl && (await copyText(formatDom(msgEl)));
+        return toast(ok ? 'Copied 1 message' : "Couldn't copy");
+      }
+      if (act === 'select' && m) {
+        if (await selectMsgs([m])) anchor = m.id.id;
+        else toast('Selection is not available');
+      }
+      return;
     }
+    // Select mode: remember the anchor, Shift+click selects everything in between.
+    const row = t.closest('#main [role="row"]');
+    const msgEl = row?.querySelector(MSG_SEL);
+    if (!msgEl || !inSelectMode()) return;
+    const id = msgEl.getAttribute('data-id');
+    if (e.shiftKey && anchor && anchor !== id) {
+      swallow(e);
+      await selectMsgs(rangeMsgs(anchor, id));
+    }
+    anchor = id;
   }, true);
 
-  document.addEventListener('scroll', () => {
-    if (hoverEl) {
-      if (hoverEl.isConnected) placeTools(hoverEl);
-      else hideTools();
-    }
+  // ⌘C / Ctrl+C in select mode copies the selected messages (unless text is highlighted).
+  window.addEventListener('keydown', (e) => {
+    if (!(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== 'c') return;
+    if (window.getSelection()?.isCollapsed === false) return;
+    if (!inSelectMode()) return;
+    const msgs = selectedMsgs();
+    if (!msgs.length) return;
+    swallow(e);
+    copyMsgs(msgs);
   }, true);
-  window.addEventListener('resize', render);
+
+  // Forget the anchor when switching chats.
+  let chatKey = null;
   setInterval(() => {
-    mount();
-    checkChat();
+    const key = activeChat()?.id?._serialized || null;
+    if (key !== chatKey) {
+      chatKey = key;
+      anchor = null;
+      hideDayTools();
+    }
   }, 1000);
 })();
