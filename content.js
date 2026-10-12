@@ -335,20 +335,30 @@
 
   // ---------- day separators ("Today", "Friday", "7/14/2026") ----------
   let listEl = null;
+  // The list holds day separators and blocks of consecutive messages; system notices such as
+  // "Use WhatsApp on your phone…" sit one level up, next to it in the messages panel.
+  const messagesPanel = () => document.querySelector('#main [data-testid="conversation-panel-messages"]');
   function messageList() {
     if (listEl?.isConnected && listEl.querySelector(MSG_SEL)) return listEl;
+    const panel = messagesPanel();
+    const fromPanel = panel && [...panel.children].find((c) => c.querySelector(MSG_SEL));
+    if (fromPanel) return (listEl = fromPanel);
     const msgs = document.querySelectorAll('#main ' + MSG_SEL);
-    if (msgs.length < 2) return (listEl = msgs[0]?.closest('[role="row"]')?.parentElement?.parentElement?.parentElement || null);
+    if (msgs.length < 2) return null;
     let a = msgs[0];
-    while (a && !a.contains(msgs[1])) a = a.parentElement;
+    while (a && !a.contains(msgs[msgs.length - 1])) a = a.parentElement;
     return (listEl = a);
   }
-  function separatorAt(target) {
-    const list = messageList();
-    if (!list || !list.contains(target)) return null;
+  // Direct child of `container` that holds `target`, unless it holds messages.
+  function nonMessageChild(container, target) {
+    if (!container || !container.contains(target)) return null;
     let el = target;
-    while (el && el.parentElement !== list) el = el.parentElement;
-    if (!el || el.querySelector(MSG_SEL)) return null;
+    while (el && el.parentElement !== container) el = el.parentElement;
+    return el && !el.querySelector(MSG_SEL) ? el : null;
+  }
+  function separatorAt(target) {
+    const el = nonMessageChild(messageList(), target);
+    if (!el) return null;
     const text = el.innerText?.trim();
     if (!text || text.length > 40 || text.includes('\n')) return null;
     return el;
@@ -406,6 +416,186 @@
     daySep = null;
   }
 
+  // ---------- older history from the phone ----------
+  // WhatsApp Web stopped offering this in the UI, but still ships the mechanism: a
+  // HISTORY_SYNC_ON_DEMAND peer-data request asks the primary phone for the messages before
+  // the oldest one stored locally. The phone answers with a history-sync chunk that WhatsApp
+  // writes to its DB; loadEarlierMsgs then pulls those into the open chat.
+  const HISTORY_BATCH = 500; // WhatsApp asks for 50 (AB prop); the phone honours larger batches.
+  const P_HISTORY = 'M13 3a9 9 0 0 0-9 9H1l3.89 3.89.07.14L9 12H6c0-3.87 3.13-7 7-7s7 3.13 7 7-3.13 7-7 7c-1.93 0-3.68-.79-4.94-2.06l-1.42 1.42A8.954 8.954 0 0 0 13 21a9 9 0 0 0 0-18zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12z';
+  const fmtDay = (t) => new Date(t * 1000).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+  let loading = null;
+
+  // Resolves 'ok' when the phone delivered a chunk, 'end' when it answered with an error
+  // (in practice: nothing older for this chat), 'timeout' when it didn't answer at all.
+  // Event-driven on purpose: Chrome throttles timers in background tabs.
+  async function requestFromPhone(chat) {
+    const AB = window.require('WAWebABProps');
+    const T = window.require('WAWebProtobufsE2E.pb').Message$PeerDataOperationRequestType;
+    const { sendPeerDataOperationRequest } = window.require('WAWebSendNonMessageDataRequest');
+    const E = window.require('WAWebHistorySyncOnDemandEvents').WAWebHistorySyncOnDemandEvents;
+    const OK = 'history_sync_on_demand_events:success_history_sync_od';
+    const ERR = 'history_sync_on_demand_events:error_history_sync_od';
+    let finish;
+    const answered = new Promise((resolve) => {
+      const timer = setTimeout(() => finish('timeout'), 45000);
+      const onOk = () => finish('ok');
+      const onErr = () => finish('end');
+      E.on(OK, onOk);
+      E.on(ERR, onErr);
+      finish = (result) => {
+        clearTimeout(timer);
+        E.off(OK, onOk);
+        E.off(ERR, onErr);
+        resolve(result);
+      };
+    });
+    const orig = AB.getABPropConfigValue;
+    AB.getABPropConfigValue = function (key) {
+      return key === 'history_sync_on_demand_message_count' ? HISTORY_BATCH : orig.apply(this, arguments);
+    };
+    try {
+      await sendPeerDataOperationRequest(T.HISTORY_SYNC_ON_DEMAND, { chatId: chat.id });
+    } catch (err) {
+      finish('timeout');
+      throw err;
+    } finally {
+      AB.getABPropConfigValue = orig;
+    }
+    return answered;
+  }
+
+  async function loadHistory() {
+    if (loading) {
+      loading.cancel = true;
+      return;
+    }
+    const chat = activeChat();
+    if (!chat) return;
+    const state = (loading = { cancel: false, chat });
+    const { loadEarlierMsgs } = window.require('WAWebChatLoadMessages');
+    const { getOldestMsgInChatFromDB } = window.require('WAWebNonMessageDataRequestHistorySyncOnDemandUtils');
+    const stillHere = () => !state.cancel && activeChat() === chat;
+    const report = (phase) => {
+      const msgs = chatMsgs();
+      showProgress(phase, msgs.length, msgs[0]?.t, state);
+    };
+    // Pull everything already in the local DB into the open chat.
+    const drainLocal = async () => {
+      for (;;) {
+        const before = chat.msgs.length;
+        chat.msgs.msgLoadState.noEarlierMsgs = false;
+        await loadEarlierMsgs({ chat });
+        if (chat.msgs.length === before || !stillHere()) return;
+        report('loading');
+      }
+    };
+    let outcome = 'done';
+    try {
+      report('loading');
+      await drainLocal();
+      while (stillHere()) {
+        const before = (await getOldestMsgInChatFromDB(chat.id))?.t;
+        const answer = await requestFromPhone(chat);
+        if (answer === 'timeout') {
+          outcome = 'offline';
+          break;
+        }
+        if (answer === 'end' || !stillHere()) break;
+        await drainLocal();
+        const after = (await getOldestMsgInChatFromDB(chat.id))?.t;
+        if (after === before) break; // the phone answered but had nothing older
+      }
+      if (state.cancel) outcome = 'stopped';
+    } catch (err) {
+      console.warn('[WA Copy] history load failed', err);
+      outcome = 'error';
+    } finally {
+      loading = null;
+    }
+    if (activeChat() === chat) report(outcome);
+  }
+
+  // Progress pill under the chat header, styled like WhatsApp's date pills.
+  const progressEl = document.createElement('div');
+  progressEl.id = 'wac-progress';
+  progressEl.innerHTML =
+    '<span class="wac-progress-text"></span>' +
+    '<button type="button" data-wac-act="copy-all">Copy all</button>' +
+    '<button type="button" data-wac-act="progress-close" aria-label="Close" title="Close"></button>';
+  progressEl.lastElementChild.appendChild(svg('M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z', 16));
+  let progressTimer = null;
+
+  function showProgress(phase, count, oldestT, state) {
+    clearTimeout(progressTimer);
+    const main = document.querySelector('#main');
+    if (!main) return;
+    if (!progressEl.isConnected) document.body.appendChild(progressEl);
+    const pill = document.querySelector('#main ' + MSG_SEL)
+      ? [...(messageList()?.children || [])].map((c) => !c.querySelector(MSG_SEL) && pillOf(c)).find(Boolean)
+      : null;
+    if (pill) {
+      const cs = getComputedStyle(pill);
+      progressEl.style.background = cs.backgroundColor;
+      progressEl.style.color = cs.color;
+      progressEl.style.boxShadow = cs.boxShadow;
+    }
+    const since = oldestT ? ` · since ${fmtDay(oldestT)}` : '';
+    const n = `${count.toLocaleString('en-US')} message${count === 1 ? '' : 's'}`;
+    const text = {
+      loading: `Loading history from phone… ${n}${since}`,
+      done: `Full history loaded · ${n}${since}`,
+      stopped: `Stopped · ${n}${since}`,
+      offline: `Phone didn't respond, keep WhatsApp open on it · ${n}${since}`,
+      error: `Couldn't load more · ${n}${since}`,
+    }[phase];
+    progressEl.querySelector('.wac-progress-text').textContent = text;
+    progressEl.dataset.phase = phase;
+    const header = main.querySelector('header')?.getBoundingClientRect();
+    const mr = main.getBoundingClientRect();
+    progressEl.style.left = mr.left + mr.width / 2 + 'px';
+    progressEl.style.top = (header ? header.bottom : mr.top) + 12 + 'px';
+    progressEl.style.display = 'flex';
+    if (phase !== 'loading') progressTimer = setTimeout(hideProgress, 15000);
+  }
+  function hideProgress() {
+    progressEl.style.display = 'none';
+  }
+
+  // Header button next to WhatsApp's own Search, cloned from it.
+  function injectHeaderButton() {
+    const header = document.querySelector('#main header');
+    if (!header || header.querySelector('.wac-header-unit')) return;
+    const iconBtn = (name) => [...header.querySelectorAll('button')].find((b) => b.querySelector('svg title')?.textContent === name);
+    const search = iconBtn('ic-search');
+    const menu = iconBtn('ic-more-vert');
+    if (!search) return;
+    let group = search.parentElement;
+    while (group && menu && !group.contains(menu)) group = group.parentElement;
+    if (!group) return;
+    let unit = search;
+    while (unit.parentElement && unit.parentElement !== group) unit = unit.parentElement;
+    const u = unit.cloneNode(true);
+    u.classList.add('wac-header-unit');
+    const b = u.querySelector('button') || u;
+    b.removeAttribute('data-testid');
+    b.setAttribute('aria-label', 'Load older messages from phone');
+    b.setAttribute('title', 'Load older messages from phone');
+    b.dataset.wacAct = 'load-history';
+    const old = b.querySelector('svg');
+    if (old) old.replaceWith(svg(P_HISTORY, 24));
+    group.insertBefore(u, unit);
+  }
+
+  // "Use WhatsApp on your phone to see older messages from before …" becomes clickable again.
+  function historyNoticeAt(target) {
+    const el = nonMessageChild(messageList(), target) || nonMessageChild(messagesPanel(), target);
+    if (!el) return null;
+    const text = el.innerText?.trim() || '';
+    // Long system line that carries a date, e.g. "… older messages from before 7/14/2026."
+    return text.length > 40 && /\d{1,4}[./-]\d{1,2}[./-]\d{1,4}/.test(text) ? el : null;
+  }
+
   // ---------- events ----------
   // Inject buttons whenever WhatsApp renders its hover controls or the select bar.
   let scheduled = false;
@@ -415,6 +605,7 @@
     const selecting = inSelectMode();
     document.body.classList.toggle('wac-selecting', selecting);
     if (selecting) injectBarButton();
+    injectHeaderButton();
   }
   new MutationObserver(() => {
     if (!scheduled) {
@@ -427,6 +618,12 @@
     const t = e.target;
     if (!(t instanceof Element)) return;
     if (t.closest('#wac-day')) return clearTimeout(dayHideTimer);
+    const notice = historyNoticeAt(t);
+    if (notice && !notice.dataset.wacNotice) {
+      notice.dataset.wacNotice = '1';
+      notice.title = 'Click to load older messages from your phone';
+      pillOf(notice).style.cursor = 'pointer';
+    }
     const sep = separatorAt(t);
     if (sep) return sep !== daySep ? showDayTools(sep) : clearTimeout(dayHideTimer);
     if (daySep) {
@@ -462,6 +659,12 @@
       swallow(e);
       const act = btn.dataset.wacAct;
       if (act === 'copy-selected') return copyMsgs(selectedMsgs());
+      if (act === 'load-history') return loadHistory();
+      if (act === 'copy-all') return copyMsgs(chatMsgs());
+      if (act === 'progress-close') {
+        if (loading) loading.cancel = true;
+        return hideProgress();
+      }
       if (act === 'select-day' || act === 'copy-day') {
         const key = daySep && separatorDay(daySep);
         const msgs = key ? dayMsgs(key) : [];
@@ -481,6 +684,10 @@
         else toast('Selection is not available');
       }
       return;
+    }
+    if (historyNoticeAt(t)) {
+      swallow(e);
+      return loadHistory();
     }
     // Select mode: remember the anchor, Shift+click selects everything in between.
     const row = t.closest('#main [role="row"]');
@@ -513,6 +720,7 @@
       chatKey = key;
       anchor = null;
       hideDayTools();
+      if (!loading) hideProgress();
     }
   }, 1000);
 })();

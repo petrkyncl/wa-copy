@@ -42,3 +42,49 @@ body.wac-selecting .wac-unit { display: none !important; }
   transition: opacity 0.15s, transform 0.15s;
 }
 #wac-toast.wac-show { opacity: 1; transform: translate(-50%, 0); }
+
+/* History-loading progress pill; colors are copied from WhatsApp's date pill at runtime. */
+#wac-progress {
+  position: fixed;
+  z-index: 1000;
+  display: none;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 4px 3px 12px;
+  transform: translateX(-50%);
+  background: rgba(255, 255, 255, 0.95);
+  color: rgba(0, 0, 0, 0.6);
+  border-radius: 7.5px;
+  box-shadow: 0 1px 0.5px rgba(11, 20, 26, 0.13);
+  font-size: 12.5px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+#wac-progress button {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+#wac-progress button:hover { background: rgba(127, 127, 127, 0.15); }
+#wac-progress [data-wac-act="copy-all"] { color: #008069; }
+#wac-progress[data-phase="loading"] [data-wac-act="copy-all"] { display: none; }
+#wac-progress[data-phase="loading"] .wac-progress-text::before {
+  content: "";
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin-right: 8px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  vertical-align: -2px;
+  animation: wac-spin 0.8s linear infinite;
+}
+@keyframes wac-spin { to { transform: rotate(360deg); } }
